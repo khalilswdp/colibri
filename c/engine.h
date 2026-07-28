@@ -116,6 +116,10 @@ typedef struct Layer {
     int shared_w4a16_failed;
 #endif
     int sparse;
+    /* Plain-QKV attention (GQA families): projections an MLA arch lacks.
+     * o_proj reuses `o` above; consumed by the CUDA_DENSE_FREE_HOST
+     * enumeration. Zero/NULL for MLA archs like GLM. */
+    QT q_proj, k_proj, v_proj;
     /* dense mlp (sparse==0) */
     QT gate_proj, up_proj, down_proj;
     /* moe (sparse==1) */

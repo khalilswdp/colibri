@@ -137,14 +137,50 @@ def sprite_lines():
         out.append(row+"\033[0m")
     return out
 
-def banner(sub="", cuda=None):
+def model_label(model_dir):
+    """Real one-line model id from config.json (family · total params (active) · quant),
+    so the banner/spinner stop saying 'GLM-5.2 · 744B' for whatever is actually loaded."""
+    try: c=json.load(open(os.path.join(model_dir,"config.json"),encoding="utf-8"))
+    except Exception: return None
+    mt=c.get("model_type","") or ""
+    arch=(c.get("architectures") or [None])[0] or ""
+    H=c.get("hidden_size",0) or 0; L=c.get("num_hidden_layers",0) or 0; V=c.get("vocab_size",0) or 0
+    E=c.get("num_experts") or c.get("num_local_experts") or c.get("n_routed_experts") or 0
+    topk=c.get("num_experts_per_tok",0) or 0
+    moe=c.get("moe_intermediate_size",0) or 0
+    nh=c.get("num_attention_heads",0) or 0
+    kv=c.get("num_key_value_heads",nh) or nh
+    hd=c.get("head_dim") or (H//nh if nh else 0)
+    inter=c.get("intermediate_size",0) or 0
+    tied=c.get("tie_word_embeddings",False)
+    emb=V*H*(1 if tied else 2)
+    per_attn=nh*hd*H + 2*kv*hd*H + H*nh*hd
+    dense_mlp=3*inter*H
+    per_layer=per_attn + (E*H + E*3*moe*H if E else dense_mlp)
+    total=emb + L*per_layer
+    active=emb + L*(per_attn + (E*H + topk*3*moe*H if E else dense_mlp))
+    fam={"qwen3_moe":"Qwen3-MoE","glm_moe_dsa":"GLM-5.2"}.get(mt, arch or mt or "MoE")
+    b=lambda n:(f"{n/1e9:.0f}B" if n>=1e9 else f"{n/1e6:.0f}M") if n else "?"
+    lbl=f"{fam} · {b(total)}"
+    if E and active and active<total: lbl+=f" ({b(active)} active)"
+    try:
+        sts=[f for f in os.listdir(model_dir) if f.endswith('.safetensors')]
+        sz=sum(os.path.getsize(os.path.join(model_dir,f)) for f in sts)
+        bpp=sz/total if total else 0
+        q=("bf16/fp16" if bpp>1.8 else "int8" if bpp>0.9 else "int4" if bpp>0.45 else
+           f"~{bpp*8:.0f}-bit" if bpp else None)
+        if q: lbl+=f" · {q}"
+    except Exception: pass
+    return lbl
+
+def banner(sub="", cuda=None, model=None):
     sp=sprite_lines()
     # cuda: True -> GPU active, False -> CPU, None -> backend not decided yet
     mode = "" if cuda is None else (" · GPU (CUDA)" if cuda else " · streaming CPU")
     txt=[
         f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
-        f"{C.gray}GLM-5.2 · 744B MoE · int4{mode}{C.r}",
+        f"{C.gray}{model or 'MoE engine'}{mode}{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
     ]
@@ -273,6 +309,13 @@ def env_for(a):
         e.setdefault("DIRECT", "1")
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
+        # - VRAM depot + in-place compute: fair 3-round A/B (frozen usage):
+        #   depot-compute beats depot-off 2/3 rounds (+10/+15%) and beats
+        #   download-only depot 3/3; GLM 0.42/0.40 tok/s repeatable @48tok.
+        #   "auto" sizes itself to measured free VRAM minus the engine reserve;
+        #   explicit VRAM_CACHE_GB=0 still disables (setdefault: override wins).
+        e.setdefault("VRAM_CACHE_GB", "auto")
+        e.setdefault("COLI_DEPOT_COMPUTE", "1")
     e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
@@ -677,15 +720,27 @@ def cmd_tune(a):
               f"{100*a.min_gain:.1f}% gain and safety gates")
     print(f"  profile: {path}\n")
 
+def chat_prompt(model_dir, user, think):
+    """Build the one-shot prompt with the model's arch-native chat template.
+    Keeps GLM byte-identical; adds Qwen3 ChatML. Unknown arch -> GLM template."""
+    mt=""
+    try: mt=json.load(open(os.path.join(model_dir,"config.json"))).get("model_type","") or ""
+    except Exception: pass
+    if mt=="qwen3_moe":
+        tk="" if think else "<think>\n\n</think>\n\n"
+        return f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{tk}"
+    tk="<think>" if think else "<think></think>"
+    return f"[gMASK]<sop><|user|>{user}<|assistant|>{tk}"
+
 def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
-    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
-    # <think> open so the engine emits its reasoning block; the default stays nothink.
-    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
-    banner("run", e.get("COLI_CUDA")=="1")  # after env_for so the backend is known
+    # Arch-aware chat template (mirrors the engine's serve-mode arch.h chat_* fields):
+    # GLM uses [gMASK]<sop> + <|user|>..<|assistant|>..<think></think>; Qwen3 uses ChatML
+    # <|im_start|>..<|im_end|>. THINK=1 opens the reasoning block; default suppresses it.
+    think = os.environ.get("THINK","0")=="1"
+    e=env_for(a); e["PROMPT"]=chat_prompt(a.model, prompt, think)
+    banner("run", e.get("COLI_CUDA")=="1", model=model_label(a.model))  # after env_for so the backend is known
     sys.exit(subprocess.call([GLM, str(a.cap if a.cap is not None else 0)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
@@ -851,8 +906,9 @@ def cmd_chat(a):
     kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
+    _mlbl=model_label(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}",
-           e.get("COLI_CUDA")=="1")  # after env_for so the backend is known
+           e.get("COLI_CUDA")=="1", model=_mlbl)  # after env_for so the backend is known
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
     # protocol coli reads one byte at a time) never flushes and chat hangs at
@@ -864,7 +920,7 @@ def cmd_chat(a):
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
     p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    sp=Spinner("waking the giant (744B)…"); sp.start()
+    sp=Spinner(f"waking {_mlbl or 'the model'}…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:

@@ -155,6 +155,23 @@ COLI_CUDA_DLLEXPORT int   coli_cuda_ds_read(const char *path, unsigned long long
 COLI_CUDA_DLLEXPORT int   coli_cuda_ds_read_host(const char *path, unsigned long long off,
                                                  unsigned long long size, void *dst);
 COLI_CUDA_DLLEXPORT int   coli_cuda_ds_submit_wait(unsigned timeout_ms);
+/* Depot D2H (VRAM-L2 miss tier): pinned per-thread staging + a dedicated
+ * non-blocking stream per thread -> full PCIe rate from many host threads,
+ * never synchronizes with compute kernels on the legacy stream. */
+/* Depot-compute (zero-copy): wrap arena device memory as a group-kernel tensor;
+ * convert an int4 arena region to the kernels' signed nibble encoding (XOR 0x88,
+ * an involution — the host applies the same mask after a depot D2H download). */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor, void *dev_weights,
+                                              void *dev_scales, int fmt, int I, int O,
+                                              int device, int gs);
+COLI_CUDA_DLLEXPORT int coli_cuda_depot_sign4(int device, void *dev_ptr, size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_depot_download(int device,const void *src,void *dst,size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_depot_download2(int device,const void *src,size_t total,
+                                                   void *dst1,size_t b1,size_t off2,void *dst2,size_t b2);
+/* OPTIONAL: fetch-cost split (bus vs trailing host memcpy), summed across
+ * threads. Zeroes on an older DLL. */
+COLI_CUDA_DLLEXPORT void coli_cuda_depot_timers(unsigned long long *dma_ns,
+                                                unsigned long long *copy_ns);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,

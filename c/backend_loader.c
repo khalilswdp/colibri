@@ -88,6 +88,13 @@ typedef int (*fn_ds_read)(const char *path,unsigned long long off,
 typedef int (*fn_ds_read_host)(const char *path,unsigned long long off,
                                unsigned long long size,void *dst);
 typedef int (*fn_ds_submit_wait)(unsigned timeout_ms);
+typedef int (*fn_depot_download)(int device,const void *src,void *dst,size_t bytes);
+typedef int (*fn_depot_download2)(int device,const void *src,size_t total,
+                                   void *dst1,size_t b1,size_t off2,void *dst2,size_t b2);
+typedef void (*fn_depot_timers)(unsigned long long *dma_ns,unsigned long long *copy_ns);
+typedef int (*fn_tensor_wrap)(ColiCudaTensor **tensor,void *dev_weights,void *dev_scales,
+                              int fmt,int I,int O,int device,int gs);
+typedef int (*fn_depot_sign4)(int device,void *dev_ptr,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
@@ -150,6 +157,11 @@ static struct {
     fn_ds_read ds_read;
     fn_ds_read_host ds_read_host;
     fn_ds_submit_wait ds_submit_wait;
+    fn_depot_download depot_download;   /* OPTIONAL: newer DLLs only (pinned-staging D2H) */
+    fn_depot_download2 depot_download2; /* OPTIONAL: single-sync two-destination variant */
+    fn_depot_timers depot_timers;       /* OPTIONAL: DMA vs host-copy cost split */
+    fn_tensor_wrap tensor_wrap;         /* OPTIONAL: depot-compute zero-copy tensor handle */
+    fn_depot_sign4 depot_sign4;         /* OPTIONAL: int4 arena offset->signed conversion */
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
     fn_pipe_peer_copy pipe_peer_copy;
@@ -290,6 +302,13 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(ds_read, fn_ds_read)
     RESOLVE_OPT(ds_read_host, fn_ds_read_host)
     RESOLVE_OPT(ds_submit_wait, fn_ds_submit_wait)
+    /* OPTIONAL symbols (newer DLLs only): absence is NOT an error — the public
+     * wrapper falls back to the legacy-stream equivalent. */
+    RESOLVE_OPT(depot_download, fn_depot_download)
+    RESOLVE_OPT(depot_download2, fn_depot_download2)
+    RESOLVE_OPT(depot_timers, fn_depot_timers)
+    RESOLVE_OPT(tensor_wrap, fn_tensor_wrap)
+    RESOLVE_OPT(depot_sign4, fn_depot_sign4)
     g_cuda.available = 1;
     return 1;
 }
@@ -472,6 +491,28 @@ int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src, int
     return g_cuda.pipe_copy2d(device, dst, dpitch, src, spitch, width, height);
 }
 
+int coli_cuda_depot_download(int device,const void *src,void *dst,size_t bytes){
+    if(!g_cuda.available) return 0;
+    if(g_cuda.depot_download) return g_cuda.depot_download(device, src, dst, bytes);
+    return g_cuda.pipe_download(device, src, dst, bytes);   /* older DLL: legacy-stream path */
+}
+
+int coli_cuda_depot_download2(int device,const void *src,size_t total,
+                               void *dst1,size_t b1,size_t off2,void *dst2,size_t b2){
+    if(!g_cuda.available) return 0;
+    (void)total;
+    if(g_cuda.depot_download2) return g_cuda.depot_download2(device, src, total, dst1, b1, off2, dst2, b2);
+    /* older DLL: two separate staged (or legacy) copies */
+    return coli_cuda_depot_download(device, src, dst1, b1) &&
+           coli_cuda_depot_download(device, (const char*)src+off2, dst2, b2);
+}
+
+void coli_cuda_depot_timers(unsigned long long *dma_ns,unsigned long long *copy_ns){
+    if(dma_ns) *dma_ns=0; if(copy_ns) *copy_ns=0;   /* older DLL: report nothing, not garbage */
+    if(!g_cuda.available || !g_cuda.depot_timers) return;
+    g_cuda.depot_timers(dma_ns,copy_ns);
+}
+
 int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_download(device, src, dst, bytes);
@@ -506,6 +547,17 @@ int coli_cuda_ds_read_host(const char *path,unsigned long long off,
 int coli_cuda_ds_submit_wait(unsigned timeout_ms){
     if(!g_cuda.available || !g_cuda.ds_submit_wait) return 0;
     return g_cuda.ds_submit_wait(timeout_ms);
+}
+
+int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,void *dev_weights,void *dev_scales,
+                          int fmt,int I,int O,int device,int gs){
+    if(!g_cuda.available || !g_cuda.tensor_wrap) return 0;   /* old DLL: depot-compute stays off */
+    return g_cuda.tensor_wrap(tensor, dev_weights, dev_scales, fmt, I, O, device, gs);
+}
+
+int coli_cuda_depot_sign4(int device,void *dev_ptr,size_t bytes){
+    if(!g_cuda.available || !g_cuda.depot_sign4) return 0;
+    return g_cuda.depot_sign4(device, dev_ptr, bytes);
 }
 
 void coli_cuda_pipe_free(int device,void *p){
