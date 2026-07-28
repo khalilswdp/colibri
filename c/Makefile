@@ -281,8 +281,13 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h antiprompt.h kv_persist.h telemetry.h arch.h engine.h arch_glm.o $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c arch_glm.o $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# Model-architecture registry: model-agnostic engine + per-model descriptors.
+# Pure C, no deps — compiles on every platform/backend unchanged.
+arch_glm.o: arch_glm.c arch.h .build-config
+	$(CC) $(CFLAGS) -c arch_glm.c -o $@
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -292,13 +297,33 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
-# __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h
+# __declspec(dllexport) so the API symbols are exported.
+#
+# DIRECTSTORAGE (optional): backend_dstorage.cpp adds the disk->VRAM DMA
+# transport. Needs the DirectStorage SDK (not part of the CUDA/Windows SDK):
+#   nuget install Microsoft.Direct3D.DirectStorage -OutputDirectory deps
+#   make cuda-dll DSTORAGE_HOME=deps/<pkg>/native
+# Without it the DLL builds and works: the entry points are optional exports
+# and the engine falls back to the CPU-staged store fill.
+DSTORAGE_HOME ?=
+ifneq ($(DSTORAGE_HOME),)
+DS_SRC   = backend_dstorage.cpp
+DS_FLAGS = -I"$(DSTORAGE_HOME)/include" -L"$(DSTORAGE_HOME)/lib/x64" -ldstorage -ld3d12 -ldxgi
+DS_NOTE  = with DirectStorage
+else
+DS_SRC   =
+DS_FLAGS =
+DS_NOTE  = WITHOUT DirectStorage (set DSTORAGE_HOME to enable disk->VRAM DMA)
+endif
+
+cuda-dll: backend_cuda.cu backend_cuda.h $(DS_SRC)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@echo "building coli_cuda.dll $(DS_NOTE)"
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu -o coli_cuda.dll
+		$(DS_FLAGS) \
+		backend_cuda.cu $(DS_SRC) -o coli_cuda.dll
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }

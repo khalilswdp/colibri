@@ -5,3 +5,17 @@ olmoe_i4/
 .build-config
 tests/test_st_mirror
 tests/test_st_pread
+
+# build outputs, by pattern (per-file lists leak new sources' objects)
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.bak
+
+coli_cuda*.dll
+
+# DirectStorage redistributables (from the nuget package, not vendored)
+dstorage.dll
+dstoragecore.dll
