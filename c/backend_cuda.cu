@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <atomic>
+#include <chrono>
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <sys/stat.h>
@@ -27,6 +29,8 @@ struct ColiCudaTensor {
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
     size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
     int tracked;
+    int borrowed;              /* weights/scales point into memory owned elsewhere (the
+                                * VRAM-L2 depot arena) — tensor_free must not cudaFree them */
     RaggedKVEntry ragged[512];
     int ragged_count;
 };
@@ -964,15 +968,21 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 "expert group issue upload")) return 0;
     for(int c=0;c<count;c++){
         int r=rows[c];
+        /* fmt=4 grouped scales need the real gs/ng — the old hardcoded (0,1) read
+         * grouped scale tables as per-row and was never hit before the depot-compute
+         * path started wrapping fmt=4 experts (the GLM tier stayed empty). */
+        int gng=host[c].ggs?(D+host[c].ggs-1)/host[c].ggs:1;
+        int ung=host[c].ugs?(D+host[c].ugs-1)/host[c].ugs:1;
+        int dng=host[c].dgs?(I+host[c].dgs-1)/host[c].dgs:1;
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),0,1);
+            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),host[c].ggs,gng);
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),0,1);
+            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),host[c].ugs,ung);
         silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
+            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),host[c].dgs,dng);
     }
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1154,8 +1164,10 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (!tensor->borrowed) {
+        if (tensor->weights) cudaFree(tensor->weights);
+        if (tensor->scales) cudaFree(tensor->scales);
+    }
     for(int i=0;i<tensor->ragged_count;i++){
         if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
         if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);
@@ -1248,6 +1260,126 @@ extern "C" int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t
 extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
+}
+/* Bus vs trailing-host-memcpy split for the VRAM-L2 report; both happen
+ * inside this DLL where the engine cannot time them. Summed across threads. */
+static std::atomic<long long> g_dep_dma_ns(0), g_dep_copy_ns(0);
+static double dep_now(void){
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()*1e-9;
+}
+static void dep_timer_add(double d0,double d1,double d2){
+    g_dep_dma_ns .fetch_add((long long)((d1-d0)*1e9),std::memory_order_relaxed);
+    g_dep_copy_ns.fetch_add((long long)((d2-d1)*1e9),std::memory_order_relaxed);
+}
+extern "C" void coli_cuda_depot_timers(unsigned long long *dma_ns,unsigned long long *copy_ns){
+    if(dma_ns)  *dma_ns =(unsigned long long)g_dep_dma_ns .load(std::memory_order_relaxed);
+    if(copy_ns) *copy_ns=(unsigned long long)g_dep_copy_ns.load(std::memory_order_relaxed);
+}
+
+/* Depot D2H (VRAM-L2): plain cudaMemcpy on pageable memory from many OMP threads
+ * serializes on the legacy stream AND syncs with compute kernels — measured
+ * 0.9 GB/s on the 8-thread expert-miss pattern. Per-THREAD pinned staging plus a
+ * per-thread non-blocking stream restores the full PCIe rate and never touches
+ * the compute stream. Staging + stream are lazily created and sized per thread
+ * (OMP teams are persistent, so they amortize to zero); the trailing host memcpy
+ * from pinned staging into the caller's pageable slab runs at memory bandwidth. */
+extern "C" int coli_cuda_depot_download(int device,const void *src,void *dst,size_t bytes){
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    static thread_local void *stage=NULL; static thread_local size_t stage_cap=0;
+    static thread_local cudaStream_t st=NULL; static thread_local int st_dev=-1;
+    if(st && st_dev!=device){ cudaStreamDestroy(st); st=NULL; }
+    if(!st){
+        if(!cuda_ok(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"depot stream")){ st=NULL; return 0; }
+        st_dev=device;
+    }
+    if(stage_cap<bytes){
+        if(stage) cudaFreeHost(stage);
+        size_t cap=(bytes+((size_t)1<<20)-1)&~(((size_t)1<<20)-1);   /* round up to 1 MB */
+        if(cudaMallocHost(&stage,cap)!=cudaSuccess){   /* see depot_download2 */
+            stage=NULL; stage_cap=0;
+            return cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost)==cudaSuccess;
+        }
+        stage_cap=cap;
+    }
+    if(!cuda_ok(cudaMemcpyAsync(stage,src,bytes,cudaMemcpyDeviceToHost,st),"depot memcpy")) return 0;
+    if(!cuda_ok(cudaStreamSynchronize(st),"depot sync")) return 0;
+    memcpy(dst,stage,bytes);
+    return 1;
+}
+/* Two-destination variant: one device->staging copy + one sync for a contiguous
+ * device region (weights at 0, scales at off2), split into two host buffers.
+ * Halves the per-fetch WDDM submit/sync overhead vs two depot_download calls. */
+extern "C" int coli_cuda_depot_download2(int device,const void *src,size_t total,
+                                          void *dst1,size_t b1,size_t off2,void *dst2,size_t b2){
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    static thread_local void *stage=NULL; static thread_local size_t stage_cap=0;
+    static thread_local cudaStream_t st=NULL; static thread_local int st_dev=-1;
+    if(st && st_dev!=device){ cudaStreamDestroy(st); st=NULL; }
+    if(!st){
+        if(!cuda_ok(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"depot2 stream")){ st=NULL; return 0; }
+        st_dev=device;
+    }
+    if(stage_cap<total){
+        if(stage) cudaFreeHost(stage);
+        size_t cap=(total+((size_t)1<<20)-1)&~(((size_t)1<<20)-1);
+        if(cudaMallocHost(&stage,cap)!=cudaSuccess){
+            /* Page-locked memory can run out; returning 0 turned this into a
+             * store MISS and a DISK re-read. Degrade to a pageable copy
+             * (still ~10x better than disk) and warn once. */
+            static int warned=0;
+            if(!warned){ warned=1;
+                fprintf(stderr,"[CUDA] VRAM-store staging unavailable (page-locked "
+                               "memory exhausted) - falling back to pageable copies; "
+                               "free host memory to restore full speed\n"); }
+            stage=NULL; stage_cap=0;
+            if(cudaMemcpy(dst1,src,b1,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+            if(cudaMemcpy(dst2,(const char*)src+off2,b2,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+            return 1;
+        }
+        stage_cap=cap;
+    }
+    double d0=dep_now();
+    if(!cuda_ok(cudaMemcpyAsync(stage,src,total,cudaMemcpyDeviceToHost,st),"depot2 memcpy")) return 0;
+    if(!cuda_ok(cudaStreamSynchronize(st),"depot2 sync")) return 0;
+    double d1=dep_now();
+    memcpy(dst1,stage,b1);
+    memcpy(dst2,(char*)stage+off2,b2);
+    dep_timer_add(d0,d1,dep_now());
+    return 1;
+}
+/* DEPOT COMPUTE (zero-copy): wrap device memory already resident in the depot arena
+ * as a tensor handle the expert-group kernels accept. No allocation, no copy —
+ * `borrowed` keeps tensor_free's hands off the arena. int4 arena regions must have
+ * been converted with coli_cuda_depot_sign4 first (the kernels read signed nibbles;
+ * the host slab format is offset-binary). */
+extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor, void *dev_weights,
+                                     void *dev_scales, int fmt, int I, int O,
+                                     int device, int gs){
+    if(!tensor || *tensor || !dev_weights || I<1 || O<1) return 0;
+    if(fmt && !dev_scales) return 0;
+    if(!find_ctx(device)) return 0;
+    size_t rb = row_bytes(fmt, I); if(!rb) return 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if(!t) return 0;
+    t->fmt=fmt; t->I=I; t->O=O; t->device=device; t->weight_bytes=rb*(size_t)O;
+    t->gs = fmt==4 && gs>0 ? gs : 0;
+    t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
+    t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
+    t->weights = dev_weights; t->scales = (float*)dev_scales;
+    t->borrowed = 1; t->tracked = 0;
+    *tensor = t;
+    return 1;
+}
+/* Convert an int4 arena region offset-binary -> signed in place (XOR 0x88, an
+ * involution — the host XORs the same mask back after a depot D2H download).
+ * Called from depot_fill (possibly from several OMP threads); the default-stream
+ * sync makes the converted bytes visible to every later stream. */
+extern "C" int coli_cuda_depot_sign4(int device, void *dev_ptr, size_t bytes){
+    DeviceContext *ctx=find_ctx(device); if(!dev_ptr||!bytes||!select_ctx(ctx)) return 0;
+    offset_to_signed_s4<<<(unsigned)((bytes+255)/256),256>>>((uint8_t*)dev_ptr,bytes);
+    return cuda_ok(cudaGetLastError(),"depot sign4 launch") &&
+           cuda_ok(cudaDeviceSynchronize(),"depot sign4 sync");
 }
 extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                                       const float *w_dev,int S,int D,float eps){

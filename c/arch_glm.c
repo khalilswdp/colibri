@@ -14,6 +14,15 @@ static const ModelArch GLM_MOE_DSA = {
     .kv_compressed = 1,
     .has_mtp       = 1,
     .has_dsa       = 1,
+    /* Official GLM-5.2 chat_template: [gMASK]<sop> once at the head of the conversation,
+     * no '\n' after roles, and <think></think> after <|assistant|> DISABLES the think
+     * block (nothink). Byte-identical to the template previously hardcoded in colibri.c. */
+    .chat_prefix   = "[gMASK]<sop>",
+    .chat_turn     = "<|user|>%s<|assistant|>%s",
+    .chat_nothink  = "<think></think>",
+    .chat_think    = "<think>",
+    .chat_eos      = "<|endoftext|>",
+    .chat_antiprompt = "<|user|>;<|assistant|>;<|observation|>;<|system|>",
 };
 
 /* The registry. New models append here. */

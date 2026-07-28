@@ -16,6 +16,21 @@ typedef struct ModelArch {
     int kv_compressed;     /* 1 = MLA latent KV (GLM/DeepSeek), 0 = plain MHA/GQA  */
     int has_mtp;           /* 1 = native multi-token-prediction draft head         */
     int has_dsa;           /* 1 = DeepSeek/GLM "lightning indexer" sparse attention */
+
+    /* --- chat template (serve + one-shot run) --- the engine builds each turn as
+     * [chat_prefix on the FIRST turn] + chat_turn(user_text, think_block), where
+     * think_block is chat_think when THINK=1 else chat_nothink. chat_eos is the token
+     * that terminates an assistant turn: it is kept as the serve stop (others are
+     * filtered, #401), and its text is the default antiprompt. All const, so a NULL
+     * field means "this arch has none" (e.g. Qwen has no BPE prefix). GLM and Qwen
+     * fill every field; a future arch that leaves them NULL falls back to raw input. */
+    const char *chat_prefix;   /* first-turn BPE prefix  (GLM "[gMASK]<sop>", Qwen "") */
+    const char *chat_turn;     /* per-turn printf fmt, exactly two %s: (user, think)   */
+    const char *chat_nothink;  /* think block when thinking is OFF (the default)       */
+    const char *chat_think;    /* think block when THINK=1                             */
+    const char *chat_eos;      /* assistant-turn terminator token name (serve stop)    */
+    const char *chat_antiprompt;/* ';'-sep text markers the decoder stops on as a backup */
+                               /* when a marker is emitted as ordinary text, not the eos id */
 } ModelArch;
 
 /* Look up a registered architecture by a config.json token, matched against either

@@ -247,8 +247,13 @@ if($script:WizGlmPin){
     # match the reader pool to the logical CPU count instead of the fixed default 8.
     $env:PIPE_WORKERS = "$([Environment]::ProcessorCount)"
     Write-Host "Disk readers: PIPE_WORKERS=$($env:PIPE_WORKERS) (measured +17% GLM decode over the default 8)" -ForegroundColor DarkGray
+    # MEASURED clean A/B: GLM 0.42 OFF vs 0.43 ON, PCIe expert fetches 416 -> 215
+    # (227 computed in place); Qwen 9.76 OFF vs 9.91 ON. Neutral-to-positive
+    # speed, halves depot PCIe traffic -> less bus contention for everything else.
+    $env:COLI_DEPOT_COMPUTE = '1'
+    Write-Host "Depot compute: routed experts already parked in VRAM run on the GPU (COLI_DEPOT_COMPUTE=1)" -ForegroundColor DarkGray
 }
-else { Remove-Item Env:PIPE_WORKERS -ErrorAction SilentlyContinue }
+else { Remove-Item Env:PIPE_WORKERS, Env:COLI_DEPOT_COMPUTE -ErrorAction SilentlyContinue }
 
 $CDir = Join-Path (Resolve-Path $RepoRoot) 'c'
 if(-not (Test-Path $Model)){ throw "Model dir not found: $Model" }
@@ -281,6 +286,13 @@ else { Remove-Item Env:COLI_CUDA_MTP -ErrorAction SilentlyContinue }
 if($VramExperts){ Remove-Item Env:CUDA_EXPERT_GB -ErrorAction SilentlyContinue; Write-Host "VRAM expert tier ON (better for long prefills, ~3x slower single-token decode)" -ForegroundColor Yellow }
 elseif($script:WizTier){ $env:CUDA_EXPERT_GB='8'; $env:COLI_GROUP_ASYNC='1'; Write-Host "Hybrid experts: 8 GB VRAM tier + async CPU||GPU overlap (night sweep 2026-07-26: Qwen 12.9 vs 11.3 tok/s at 6 GB; GLM 0.43 vs 0.35)" -ForegroundColor Green }
 else { $env:CUDA_EXPERT_GB = '0'; Write-Host "Experts in RAM / CPU decode (fast interactive chat). -VramExperts to change." -ForegroundColor DarkGray }
+
+# VRAM L2 DEPOT (VRAM_CACHE_GB): the VRAM left idle by the config above holds raw expert
+# slabs; RAM misses are then served D2H over PCIe (~1-4 ms) instead of from disk (~5-10 ms
+# NVMe). RAM + depot ~= whole model -> near-zero disk during decode. 'auto' = free VRAM
+# minus the engine reserve. Engine default is OFF, so GLM setups elsewhere are untouched.
+if(-not $env:VRAM_CACHE_GB){ $env:VRAM_CACHE_GB = 'auto' }
+Write-Host "VRAM L2 depot: VRAM_CACHE_GB=$($env:VRAM_CACHE_GB) (idle VRAM serves RAM misses over PCIe)" -ForegroundColor Green
 
 # RAM budget: when the user does not pass -RamGB, compute one that is BOTH greedy and safe.
 # Two failure modes to avoid:
